@@ -775,13 +775,39 @@ neatsvpv(SV *sv, STRLEN maxlen) /* return a tidy ascii value, for debugging only
         sv_catsv(nsv, infosv);
     v = SvPV(nsv, len);
     if (!SvUTF8(sv) && len > 0) {
-        STRLEN start = (!infosv && len >= 2 && v[0] == '\'' && v[len - 1] == '\'') ? 1 : 0;
-        STRLEN end   = (!infosv && len >= 2 && v[0] == '\'' && v[len - 1] == '\'') ? len - 1 : len;
-        STRLEN off   = start + dbi_scan_nonprint_or_quote(v + start, end - start, MY_CXT.force_scalar);
+        STRLEN off, end;
+        if (!infosv && len >= 2 && v[0] == '\'' && v[len - 1] == '\'') {
+            off = 1;
+            end = len - 1;
+        } else {
+            off = 0;
+            end = len;
+        }
+        if (end - off >= 128) {
+            const int force_scalar = MY_CXT.force_scalar;
+            while (end - off >= 64) {
+                off += dbi_scan_nonprint_or_quote(v + off, end - off, force_scalar);
+                if (off >= end)
+                    break;
+                {
+                    const char c = v[off] & 0x7F; /* ignore top bit for multinational chars */
+                    if (!isPRINT(c) && !isSPACE(c))
+                        v[off] = '.';
+                }
+                off++;
+            }
+        }
         while (off < end) { /* cleanup string (map control chars to ascii etc) */
-            const char c = v[off] & 0x7F;       /* ignore top bit for multinational chars */
+            const unsigned char c = (unsigned char)(v[off] & 0x7F); /* ignore top bit for multinational chars */
+#ifdef EBCDIC
             if (!isPRINT(c) && !isSPACE(c))
                 v[off] = '.';
+#else
+            if (DBI_UNLIKELY((unsigned char)(c - 0x20) >= 0x5Fu)) {
+                if (!isSPACE(c))
+                    v[off] = '.';
+            }
+#endif
             off++;
         }
     }

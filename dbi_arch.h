@@ -277,6 +277,33 @@ dbi_arch_force_scalar_env(void)
 #endif
 }
 
+/* Cached hot-path check for PERL_FORCE_SCALAR / PERL_DBI_FORCE_SCALAR.
+ * Suitable for driver fetch loops (e.g. ChopBlanks) without per-row getenv(). */
+static inline int
+dbi_arch_force_scalar(void)
+{
+#if DBI_SIMD_COMPILE_DISABLED
+    return 1;
+#else
+    static int cached = -1;
+# if defined(__GNUC__) || defined(__clang__)
+    int v = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (DBI_UNLIKELY(v < 0)) {
+        v = dbi_arch_force_scalar_env();
+        __atomic_store_n(&cached, v, __ATOMIC_RELAXED);
+    }
+    return v;
+# else
+    int v = cached;
+    if (DBI_UNLIKELY(v < 0)) {
+        v = dbi_arch_force_scalar_env();
+        cached = v;
+    }
+    return v;
+# endif
+#endif
+}
+
 static inline const char *
 dbi_arch_simd_name(int force_scalar)
 {
