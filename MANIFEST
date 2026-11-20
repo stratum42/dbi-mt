@@ -77,9 +77,9 @@ lib/Win32/DBIODBC.pm		An experimental Win32::ODBC emulation layer for DBI
 LICENSE
 Makefile.PL			The Makefile generator
 MANIFEST
-MT_README.md			perl5-mt Tier 1 support notes and caveats
 Perl.xs				Test harness (currently) for Driver.xst
-README.md
+README.md			perl5-mt Tier 1 support notes and caveats
+README.upstream.md		Original upstream DBI README
 SECURITY.md
 t/01basics.t
 t/02dbidrv.t

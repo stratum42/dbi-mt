@@ -1,93 +1,96 @@
-# DBI - The Perl Database Interface.
+# DBI for perl5-mt
 
-[![Build Status](https://github.com/perl5-dbi/dbi/workflows/Test/badge.svg)](https://github.com/perl5-dbi/dbi/actions)
+This repository carries a small set of changes on top of upstream
+[DBI](https://github.com/perl5-dbi/dbi) so that DBI and thread-safe DBD
+drivers can run in-process (Tier 1) across
+[`perl5-mt`](https://github.com/stratum42/perl5-mt) worker threads, while
+remaining compatible with stock Perl 5.
 
-See [COPYRIGHT](https://metacpan.org/module/DBI#COPYRIGHT)
-section in DBI.pm for usage and distribution rights.
+DBI is the work of Tim Bunce, H.Merijn Brand, and decades of contributors
+across the Perl community. Everything here builds directly on their design,
+and upstream history is left untouched. For the original upstream DBI quick
+start, mailing list, and support guidelines, see
+[README.upstream.md](README.upstream.md).
 
-See [GETTING HELP](https://metacpan.org/module/DBI#GETTING-HELP)
-section in DBI.pm for how to get help.
+## What Changed and Why
 
-# QUICK START GUIDE:
+1. **Tier 1 (`PERL_XS_THREADSAFE=1`) support in `DBI.xs` and `DBIXS.h`**
+   - `Makefile.PL` detects `perl5-mt` via `DBI::DBD::dbd_mt_threadsafe_defines()`
+     and adds `-DPERL_XS_THREADSAFE=1` unless `PERL_DBI_NO_MT=1` is set.
+   - `DBIXS.h` defines `PERL_NO_GET_CONTEXT` when `PERL_XS_THREADSAFE` is active
+     and loads/stores the cached `dbi_state_lval_p` pointer with acquire/release
+     atomics.
+   - Outer-to-inner method dispatch caching (`dbi_ima_t`) is split so that the
+     shared `CV` metadata holds only an immutable slot index (`ima_id`), while
+     each interpreter keeps its own `stash`/`gv`/`generation` cache in
+     `MY_CXT.ima_cache`. That avoids cross-thread writes into frozen `CV`s after
+     `MT::Image::freeze()`.
+   - Dynamic dispatch wrappers created by `_install_method` are marked
+     `CvMT_THREADSAFE_on`, and `XS_DBI_dispatch` skips `use_xsbypass` when the
+     target driver XSUB is a Tier 2 remote compartment (`CvMT_REMOTE`).
 
-    The DBI requires one or more 'driver' modules to talk to databases,
-    but they are not needed to build or install the DBI.
+2. **Freeze and `CLONE` hygiene in Perl modules**
+   - Package-scoped `our` variables and `CLONE` hooks are used for driver
+     handles and caches in `DBI.pm`, `DBD::Switch`, `DBD::Sponge`,
+     `DBD::Gofer::Transport::null`, `DBD::Gofer::Transport::stream`, and
+     `DBI::PurePerl` so worker interpreters do not inherit frozen parent state.
+   - `DBD::File` and `DBD::ExampleP` use lexical directory and file handles
+     (`opendir`/`open`) rather than `Symbol::gensym` / `IO::Dir` / `IO::File`
+     package globs where those interact poorly with frozen stashes.
 
-    Check that a DBD::* module exists for the database you wish to use.
+3. **Per-worker, fiber-aware connection pooling (`DBI::MT::Pool`)**
+   - `DBI::MT::Pool` stores only immutable configuration in the pool object so
+     it can be constructed before `MT::Image::freeze()`. Each worker lazily
+     maintains its own idle connections in `our %DBI::MT::Pool::_POOLS`
+     (cleared in `CLONE`), and parks/wakes contending `MT::Fiber` coroutines
+     within that worker.
 
-    Install the DBI using a installer like cpanm, cpanplus, cpan,
-    or whatever is recommened by the perl distribution you're using.
-    Make sure the DBI tests run successfully before installing.
+4. **Dual-gated SIMD helpers (`dbi_arch.h`)**
+   - `dbi_arch.h` provides portable acquire/release atomics, architecture
+     cache-line sizing, a cached `dbi_arch_force_scalar()` runtime toggle, and
+     small SIMD string-scanning helpers for `ChopBlanks` trailing-space
+     trimming, `preparse()`, and `neatsvpv()`.
+   - Every SIMD path has an exact scalar reference twin and is bypassed when
+     compiled with `-DPERL_FORCE_SCALAR` or `-DDBI_FORCE_SCALAR` (or on
+     EBCDIC), or at runtime with `PERL_FORCE_SCALAR=1` or
+     `PERL_DBI_FORCE_SCALAR=1`.
 
-    Use the 'perldoc DBI' command to read the DBI documentation.
+## Caveats and Limitations
 
-    Install the DBD::* driver module you wish to use in the same way.
-    It is often important to read the driver README file carefully.
-    Make sure the driver tests run successfully before installing.
+- **Database handles are not shared across threads.** Each `MT::Worker` opens
+  and owns its own DBI handles, just as under stock Perl `ithreads`.
+- **Tier 1 is opt-in per driver.** Only drivers whose XS code and underlying C
+  client library are thread-safe should compile with `-DPERL_XS_THREADSAFE=1`.
+  Unmodified drivers continue to run in `perl5-mt` Tier 2 XS compartments. Set
+  `PERL_DBI_NO_MT=1` at build time to disable Tier 1 compilation.
+- **Blocking C drivers still block the worker OS thread.** `DBI::MT::Pool`
+  coordinates `MT::Fiber` checkout contention within a worker, but a
+  synchronous C query inside a DBD driver will occupy that worker thread until
+  it returns.
+- **SIMD helpers are narrow by design.** On short strings or workloads that do
+  not enable `ChopBlanks` or heavy `preparse()`, the vector paths are neutral
+  relative to the scalar loops; use `PERL_DBI_FORCE_SCALAR=1` to compare on
+  your own workload.
 
-The DBI.pm file contains the DBI specification and other documentation.
-PLEASE READ IT. It'll save you asking questions on the mailing list
-which you will be told are already answered in the documentation.
+## Building and Testing
 
-For more information and to keep informed about progress you can join
-the a mailing list via mailto:dbi-users-help@perl.org
-You can post to the mailing list without subscribing. (Your first post may be
-delayed a day or so while it's being moderated.)
+```sh
+/path/to/perl5-mt Makefile.PL
+make
+/path/to/perl5-mt -Mblib -I/path/to/dbd-sqlite-mt/blib/lib -I/path/to/dbd-sqlite-mt/blib/arch \
+    -I/path/to/dbd-odbc-mt/blib/lib -I/path/to/dbd-odbc-mt/blib/arch \
+    -MTest::Harness -e 'runtests(@ARGV)' t/mt_*.t
+```
 
-To help you make the best use of the dbi-users mailing list,
-and any other lists or forums you may use, I strongly
-recommend that you read "How To Ask Questions The Smart Way"
-by Eric Raymond:
- 
-  http://www.catb.org/~esr/faqs/smart-questions.html
+## Related Repositories
 
-Much useful information and online archives of the mailing lists can be
-found at http://dbi.perl.org/
+- [`stratum42/perl5-mt`](https://github.com/stratum42/perl5-mt) — Multi-threaded Perl 5 runtime
+- [`stratum42/dbd-sqlite-mt`](https://github.com/stratum42/dbd-sqlite-mt) — `DBD::SQLite` with Tier 1 support
+- [`stratum42/dbd-odbc-mt`](https://github.com/stratum42/dbd-odbc-mt) — `DBD::ODBC` with Tier 1 support
+- [`stratum42/dbi-mt-bench`](https://github.com/stratum42/dbi-mt-bench) — Benchmarks and reproducibility harness
 
-See also http://metacpan.org/pod/DBI
+## Upstream Documentation
 
-
-# IF YOU HAVE PROBLEMS:
-
-First, read the notes in the INSTALL file.
-
-If you can't fix it your self please post details to dbi-users@perl.org.
-Please include:
-
-1. A complete log of a complete build, e.g.:
-
-    perl Makefile.PL           (do a make realclean first)
-    make
-    make test
-    make test TEST_VERBOSE=1   (if any of the t/* tests fail)
-
-2. The output of perl -V
-
-3. If you get a core dump, try to include a stack trace from it.
-
-    Try installing the Devel::CoreStack module to get a stack trace.
-    If the stack trace mentions XS_DynaLoader_dl_load_file then rerun
-    make test after setting the environment variable PERL_DL_DEBUG to 2.
-
-4. If your installation succeeds, but your script does not behave
-   as you expect, the problem is possibly in your script.
-
-    Before sending to dbi-users, try writing a small, easy to use test case to
-    reproduce your problem. Also, use the DBI->trace method to trace your
-    database calls.
-
-Please don't post problems to usenet, google groups or perl5-porters.
-This software is supported via the dbi-users mailing list.  For more
-information and to keep informed about progress you can join the
-mailing list via mailto:dbi-users-help@perl.org
-(please note that I do not run or manage the mailing list).
-
-It is important to check that you are using the latest version before
-posting. If you're not then we're very likely to simply say "upgrade to
-the latest". You would do yourself a favour by upgrading beforehand.
-
-Please remember that we're all busy. Try to help yourself first,
-then try to help us help you by following these guidelines carefully.
-
-Regards,
-Tim Bunce and the perl5-dbi team.
+The original DBI README by Tim Bunce and the perl5-dbi team is preserved
+unchanged at [README.upstream.md](README.upstream.md). Feedback, bug reports,
+and corrections are always welcome.
