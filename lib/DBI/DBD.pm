@@ -3257,6 +3257,46 @@ B<DBD::CSV> class:
       ...
   }
 
+=head1 PERL5-MT TIER 1 DRIVERS
+
+On C<perl5-mt>, XS drivers that are safe to execute concurrently across worker
+interpreters can opt in to Tier 1 (in-process) execution by compiling with
+C<-DPERL_XS_THREADSAFE=1>.  Use L</dbd_mt_threadsafe_defines> in your
+F<Makefile.PL>:
+
+  use DBI::DBD;
+  my $mt_def = dbd_mt_threadsafe_defines();
+  # append $mt_def to DEFINE in WriteMakefile(...)
+
+A Tier 1 DBD driver must follow three rules:
+
+=over 4
+
+=item 1. Package-scoped C<our $drh>
+
+Declare the driver handle with C<our $drh = undef;> (not a file-scoped
+C<my $drh>) so each worker interpreter gets its own package variable after
+C<MT::Image::freeze()>.
+
+=item 2. Reset driver state in C<CLONE>
+
+Implement C<sub CLONE { undef $drh; }> (and call C<MY_CXT_CLONE> if the driver
+uses C<MY_CXT>) so cloned worker interpreters never inherit a parent driver
+handle or per-interpreter XS state.
+
+=item 3. Compile with C<-DPERL_XS_THREADSAFE=1>
+
+Include F<DBIXS.h> (which automatically defines C<PERL_NO_GET_CONTEXT> when
+C<PERL_XS_THREADSAFE> is set), avoid writable process-global C state, and
+ensure the underlying database client library is thread-safe.
+
+Tier 1 is strictly opt-in: drivers that have not been audited for thread safety
+continue to work unmodified in C<perl5-mt> Tier 2 compartments.  Set
+C<PERL_DBI_NO_MT=1> in the environment to force a Tier 2 build even for drivers
+that support Tier 1.
+
+=back
+
 =cut
 
 use Exporter ();
@@ -3286,6 +3326,7 @@ our @EXPORT = qw(
     dbd_dbi_arch_dir
     dbd_edit_mm_attribs
     dbd_postamble
+    dbd_mt_threadsafe_defines
 );
 
 our $is_dbi;
@@ -3453,6 +3494,22 @@ sub dbd_dbi_arch_dir {
     Carp::carp( "Multiple copies of Driver.xst found in: @xst") if @xst > 1;
     print "Using DBI $DBI::VERSION (for perl $] on $Config{archname}) installed in $xst[0]\n";
     return File::Spec->canonpath($xst[0]);
+}
+
+sub dbd_mt_threadsafe_defines {
+    return '' if $ENV{PERL_DBI_NO_MT};
+    my $is_mt = 0;
+    my $xsub_h = File::Spec->catfile($Config{archlibexp} || '', 'CORE', 'XSUB.h');
+    if (-f $xsub_h && open my $fh, '<', $xsub_h) {
+        local $/;
+        my $content = <$fh>;
+        close $fh;
+        $is_mt = 1 if defined $content && $content =~ /\bPERL_XS_THREADSAFE\b/;
+    }
+    if (!$is_mt) {
+        $is_mt = 1 if eval { require MT; 1 };
+    }
+    return $is_mt ? '-DPERL_XS_THREADSAFE=1' : '';
 }
 
 sub dbd_postamble {

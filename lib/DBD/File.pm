@@ -409,8 +409,8 @@ sub data_sources {
 	push @dir, grep { -d $_ } @{$attr->{f_dir_search}};
     my @dsns;
     foreach $dir (@dir) {
-	my $dirh = IO::Dir->new ($dir);
-	unless (defined $dirh) {
+	my $dirh;
+	unless (opendir ($dirh, $dir)) {
 	    $drh->set_err ($DBI::stderr, "Cannot open directory $dir: $!");
 	    return;
 	    }
@@ -418,12 +418,13 @@ sub data_sources {
 	my ($file, %names, $driver);
 	$driver = $drh->{ImplementorClass} =~ m/^dbd\:\:([^\:]+)\:\:/i ? $1 : "File";
 
-	while (defined ($file = $dirh->read ())) {
+	while (defined ($file = readdir ($dirh))) {
 	    my $d = File::Spec->catdir ($dir, $file);
 	    # allow current dir ... it can be a data_source too
 	    $file ne File::Spec->updir () && -d $d and
 		push @dsns, "DBI:$driver:f_dir=" . &{$dsn_quote} ($d) . ($dsnextra ? ";$dsnextra" : "");
 	    }
+	closedir ($dirh);
 	}
     return @dsns;
     } # data_sources
@@ -440,9 +441,8 @@ sub avail_tables {
     $dbh->{f_dir_search} && ref $dbh->{f_dir_search} eq "ARRAY" and
 	push @dir, grep { -d $_ } @{$dbh->{f_dir_search}};
     foreach $dir (@dir) {
-	my $dirh = IO::Dir->new ($dir);
-
-	unless (defined $dirh) {
+	my $dirh;
+	unless (opendir ($dirh, $dir)) {
 	    $dbh->set_err ($DBI::stderr, "Cannot open directory $dir: $!");
 	    return;
 	    }
@@ -454,13 +454,13 @@ sub avail_tables {
 	    ? defined $dbh->{f_schema} && $dbh->{f_schema} ne ""
 		? $dbh->{f_schema} : undef
 	    : eval { getpwuid ((stat $dir)[4]) }; # XXX Win32::pwent
-	while (defined ($file = $dirh->read ())) {
+	while (defined ($file = readdir ($dirh))) {
 	    my ($tbl, $meta) = $class->get_table_meta ($dbh, $file, 0, 0) or next; # XXX
 	    # $tbl && $meta && -f $meta->{f_fqfn} or next;
 	    $seen{$schema // "\0"}{$dir}{$tbl}++ or
 		push @tables, [ undef, $schema, $tbl, "TABLE", "FILE" ];
 	    }
-	$dirh->close () or
+	closedir ($dirh) or
 	    $dbh->set_err ($DBI::stderr, "Cannot close directory $dir: $!");
 	}
 
@@ -668,11 +668,11 @@ sub complete_table_name {
 	    }
 
 	my @f;
-	{   my $dh = IO::Dir->new ($searchdir) or croak "Can't open '$searchdir': $!";
+	{   opendir (my $dh, $searchdir) or croak "Can't open '$searchdir': $!";
 	    @f = sort { length $b <=> length $a }
 		 grep { &$cmpsub ($_) }
-		 $dh->read ();
-	    $dh->close () or croak "Can't close '$searchdir': $!";
+		 readdir ($dh);
+	    closedir ($dh) or croak "Can't close '$searchdir': $!";
 	    }
 	@f > 0 && @f <= 2 and $file = $f[0];
 	!$respect_case && $meta->{sql_identifier_case} == 4 and # XXX SQL_IC_MIXED
@@ -718,11 +718,11 @@ sub open_data {
 	if ($flags->{createMode}) {
 	    -f $meta->{f_fqfn} and
 		croak "Cannot create table $attrs->{table}: Already exists";
-	    $fh = IO::File->new ($fn, "a+") or
+	    open ($fh, "+>>", $fn) or
 		croak "Cannot open $fn for writing: $! (" . ($!+0) . ")";
 	    }
 	else {
-	    unless ($fh = IO::File->new ($fn, ($flags->{lockMode} ? "r+" : "r"))) {
+	    unless (open ($fh, ($flags->{lockMode} ? "+<" : "<"), $fn)) {
 		croak "Cannot open $fn: $! (" . ($!+0) . ")";
 		}
 	    }
@@ -738,19 +738,20 @@ sub open_data {
 	}
     if ($meta->{f_fqln}) {
 	$fn = $meta->{f_fqln};
+	my $lockfh;
 	if ($flags->{createMode}) {
 	    -f $fn and
 		croak "Cannot create table lock at '$fn' for $attrs->{table}: Already exists";
-	    $fh = IO::File->new ($fn, "a+") or
+	    open ($lockfh, "+>>", $fn) or
 		croak "Cannot open $fn for writing: $! (" . ($!+0) . ")";
 	    }
 	else {
-	    unless ($fh = IO::File->new ($fn, ($flags->{lockMode} ? "r+" : "r"))) {
+	    unless (open ($lockfh, ($flags->{lockMode} ? "+<" : "<"), $fn)) {
 		croak "Cannot open $fn: $! (" . ($!+0) . ")";
 		}
 	    }
 
-	$meta->{lockfh} = $fh;
+	$meta->{lockfh} = $fh = $lockfh;
 	}
 
     if ($self->can_flock && $fh) {

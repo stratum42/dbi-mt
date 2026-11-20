@@ -142,7 +142,7 @@
 	my %types = map { $_=>$_ } @types;
 
 	# Return a list of all subdirectories
-	my $dh = Symbol::gensym(); # "DBD::ExampleP::".++$DBD::ExampleP::gensym;
+	my $dh;
 	my $dir = $catalog || File::Spec->curdir();
 	my @list;
 	if ($types{VIEW}) {	# for use by test harness
@@ -340,7 +340,7 @@
 	}
 	else {
 	    $sth->{dbd_dir} = $dir;
-	    my $sym = Symbol::gensym(); # "DBD::ExampleP::".++$DBD::ExampleP::gensym;
+	    my $sym;
 	    opendir($sym, $dir)
                 or return $sth->set_err(2, "opendir($dir): $!");
 	    $sth->{dbd_datahandle} = $sym;

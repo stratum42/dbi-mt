@@ -134,6 +134,49 @@ if (my $gccversion = $Config{gccversion}) {	# ask gcc to be more pedantic
 
 $opts{DEFINE} .= " -DDBI_NO_THREADS" unless $::opt_thread;
 
+if (my $mt_def = dbd_mt_threadsafe_defines()) {
+    $opts{DEFINE} = defined $opts{DEFINE} ? "$opts{DEFINE} $mt_def" : $mt_def;
+}
+
+# Explicit header dependencies (including dbi_arch.h for SIMD & portable atomics)
+$opts{H} = [ qw(
+    DBIXS.h
+    dbd_xsh.h
+    dbi_arch.h
+    dbi_sql.h
+    dbipport.h
+    dbivport.h
+    dbixs_rev.h
+    Driver_xst.h
+) ];
+
+# Probe optional architecture vector flags on POWER / s390x when not already set
+{
+    my $arch    = $Config{archname} || "";
+    my $ccflags = $Config{ccflags}  || "";
+    my $cc      = $Config{cc}       || "";
+    my $probe_flag;
+    if ($arch =~ /s390x/i && $ccflags !~ /-mzvector\b/ && $Config{gccversion}) {
+        $probe_flag = "-march=z13 -mzvector";
+    }
+    elsif ($arch =~ /(?:ppc64|powerpc64)/i && $ccflags !~ /-mvsx\b/ && $Config{gccversion}) {
+        $probe_flag = "-mvsx";
+    }
+    if ($probe_flag && $cc) {
+        my $tmp_c = "dbi_arch_probe_$$.c";
+        if (open my $fh, ">", $tmp_c) {
+            print $fh "int dbi_arch_probe(void) { return 0; }\n";
+            close $fh;
+            my $null = File::Spec->devnull;
+            my $rc = system("$cc $probe_flag -fsyntax-only $tmp_c >$null 2>&1");
+            unlink $tmp_c;
+            if ($rc == 0) {
+                $opts{CCFLAGS} = "$ccflags $probe_flag";
+            }
+        }
+    }
+}
+
 # HP-UX 9 cannot link a non-PIC object file into a shared library.
 # Since the # .a libs that Oracle supplies contain non-PIC object
 # files, we sadly have to build static on HP-UX 9 :(
@@ -348,10 +391,10 @@ sub post_constants {
     my $xst = main::dbd_postamble ();
     $xst =~ s/\$\(BASEEXT\)/Perl/g;
     $xst .= '
-dbixs_rev.h: DBIXS.h Driver_xst.h dbipport.h dbivport.h dbixs_rev.pl
+dbixs_rev.h: DBIXS.h Driver_xst.h dbi_arch.h dbipport.h dbivport.h dbixs_rev.pl
 	$(PERL) dbixs_rev.pl
 
-DBI.c: Perl$(OBJ_EXT)
+DBI.c: Perl$(OBJ_EXT) dbi_arch.h
 
 # make Changes file available as installed pod docs "perldoc DBI::Changes"
 inst_libdbi = ' . File::Spec->catdir  ($self->{INST_LIB}, 'DBI') . '

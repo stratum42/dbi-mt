@@ -20,9 +20,8 @@
 /* The XS dispatcher code can optimize calls to XS driver methods,
  * bypassing the usual call_sv() and argument handling overheads.
  * Just-in-case it causes problems there's an (undocumented) way
- * to disable it by setting an env var.
+ * to disable it by setting an env var (stored in MY_CXT.use_xsbypass).
  */
-static int use_xsbypass = 1; /* set in dbi_bootinit() */
 
 #ifndef CvISXSUB
 #define CvISXSUB(sv) CvXSUB(sv)
@@ -146,12 +145,30 @@ typedef struct dbi_ima_st {
     U32 flags;
     meth_types meth_type;
 
-    /* cached outer to inner method mapping */
+    /* immutable slot index into per-interpreter MY_CXT.ima_cache */
+    U32 ima_id;
+
+} dbi_ima_t;
+
+static U32 dbi_ima_next_id = 0;
+
+static U32
+dbi_ima_alloc_id(void)
+{
+    return dbi_atomic_inc_u32(&dbi_ima_next_id) - 1;
+}
+
+typedef struct dbi_ima_cache_entry_st {
     HV *stash;          /* the stash we found the GV in */
     GV *gv;             /* the GV containing the inner sub */
     U32 generation;     /* cache invalidation */
+    U32 _pad;           /* pad to 32B on 64-bit for clean cache-line stride */
+} dbi_ima_cache_entry_t;
 
-} dbi_ima_t;
+typedef struct dbi_ima_cache_st {
+    dbi_ima_cache_entry_t *entries;
+    U32 len;
+} dbi_ima_cache_t;
 
 /* These values are embedded in the data passed to install_method       */
 #define IMA_HAS_USAGE             0x00000001  /* check parameter usage        */
@@ -226,10 +243,16 @@ static MGVTBL dbi_ima_vtbl = { 0, 0, 0, 0, dbi_ima_free,
 
 static int dbi_ima_free(pTHX_ SV* sv, PERL_UNUSED_DECL MAGIC* mg)
 {
-    dbi_ima_t *ima = (dbi_ima_t *)(CvXSUBANY((CV*)sv).any_ptr);
-    SvREFCNT_dec(ima->stash);
-    SvREFCNT_dec(ima->gv);
-    Safefree(ima);
+    dbi_ima_t *ima;
+#ifdef SVf_IMMORTAL
+    if (SvFLAGS(sv) & SVf_IMMORTAL)
+        return 0;
+#endif
+    ima = (dbi_ima_t *)(CvXSUBANY((CV*)sv).any_ptr);
+    if (ima) {
+        Safefree(ima);
+        CvXSUBANY((CV*)sv).any_ptr = NULL;
+    }
     return 0;
 }
 
@@ -244,14 +267,56 @@ static int dbi_ima_dup(pTHX_ MAGIC* mg, CLONE_PARAMS *param)
     mg->mg_ptr = (char *)ncv;
     ima = (dbi_ima_t*) CvXSUBANY(cv).any_ptr;
     Newx(nima, 1, dbi_ima_t);
-    *nima = *ima; /* structure copy */
+    *nima = *ima; /* structure copy (preserves ima_id) */
     CvXSUBANY(ncv).any_ptr = nima;
-    nima->stash = NULL;
-    nima->gv    = NULL;
     return 0;
 }
 #endif
 
+static int dbi_ima_cache_free(pTHX_ SV *sv, MAGIC *mg)
+{
+    dbi_ima_cache_t *cache = (dbi_ima_cache_t *)mg->mg_ptr;
+    PERL_UNUSED_ARG(sv);
+    if (cache) {
+        if (cache->entries) {
+            if (!PL_dirty) {
+                U32 i;
+                for (i = 0; i < cache->len; ++i) {
+                    SvREFCNT_dec(cache->entries[i].stash);
+                    SvREFCNT_dec(cache->entries[i].gv);
+                }
+            }
+            Safefree(cache->entries);
+        }
+        Safefree(cache);
+        mg->mg_ptr = NULL;
+    }
+    return 0;
+}
+
+#if defined(USE_ITHREADS)
+static int dbi_ima_cache_dup(pTHX_ MAGIC *mg, CLONE_PARAMS *param)
+{
+    PERL_UNUSED_ARG(param);
+    /* Each interpreter owns its own ima_cache; never alias parent's. */
+    mg->mg_ptr = NULL;
+    return 0;
+}
+#endif
+
+static MGVTBL dbi_ima_cache_vtbl = { 0, 0, 0, 0, dbi_ima_cache_free,
+                                     0,
+#if defined(USE_ITHREADS)
+                                     dbi_ima_cache_dup
+#else
+                                     0
+#endif
+#if (PERL_REVISION == 5)
+# if (PERL_VERSION > 8) || ((PERL_VERSION == 8) && (PERL_SUBVERSION >= 9))
+                                     , 0
+# endif
+#endif
+                                     };
 
 
 /* --- make DBI safe for multiple perl interpreters --- */
@@ -263,9 +328,45 @@ static int dbi_ima_dup(pTHX_ MAGIC* mg, CLONE_PARAMS *param)
 typedef struct {
     SV   *dbi_last_h;  /* maybe better moved into dbistate_t? */
     dbistate_t* dbi_state;
+    int   use_xsbypass;
+    int   force_scalar;
+    dbi_ima_cache_t *ima_cache;
 } my_cxt_t;
 
 START_MY_CXT
+
+static dbi_ima_cache_entry_t *
+dbi_ima_cache_slot(pTHX_ pMY_CXT_ U32 ima_id)
+{
+    dbi_ima_cache_t *cache = MY_CXT.ima_cache;
+    if (DBI_UNLIKELY(!cache)) {
+        SV *guard;
+        MAGIC *mg;
+        Newxz(cache, 1, dbi_ima_cache_t);
+        guard = newSV(0);
+        mg = sv_magicext(guard, NULL, DBI_MAGIC, &dbi_ima_cache_vtbl,
+                         (char *)cache, 0);
+        mg->mg_flags |= MGf_DUP;
+        (void)hv_stores(PL_modglobal, "DBI::_ima_cache_guard", guard);
+        MY_CXT.ima_cache = cache;
+    }
+    if (DBI_UNLIKELY(ima_id >= cache->len)) {
+        U32 new_len = cache->len ? cache->len : 64;
+        while (new_len <= ima_id)
+            new_len *= 2;
+        if (cache->entries) {
+            Renew(cache->entries, new_len, dbi_ima_cache_entry_t);
+        }
+        else {
+            Newx(cache->entries, new_len, dbi_ima_cache_entry_t);
+        }
+        Zero(cache->entries + cache->len, new_len - cache->len,
+             dbi_ima_cache_entry_t);
+        cache->len = new_len;
+    }
+    DBI_PREFETCH_READ(&cache->entries[ima_id]);
+    return &cache->entries[ima_id];
+}
 
 #undef DBIS
 #define DBIS                   (MY_CXT.dbi_state)
@@ -478,9 +579,8 @@ check_version(const char *name, int dbis_cv, int dbis_cs, int need_dbixs_cv, int
 }
 
 static void
-dbi_bootinit(dbistate_t * parent_dbis)
+dbi_bootinit(pTHX_ dbistate_t * parent_dbis)
 {
-    dTHX;
     dMY_CXT;
     dbistate_t* DBISx;
 
@@ -502,10 +602,9 @@ dbi_bootinit(dbistate_t * parent_dbis)
     DBIS->logfp       = PerlIO_stderr();
     DBIS->debug       = (parent_dbis) ? parent_dbis->debug
                             : SvIV(get_sv("DBI::dbi_debug",0x5));
-    DBIS->neatsvpvlen = (parent_dbis) ? parent_dbis->neatsvpvlen
-                                      : get_sv("DBI::neat_maxlen", GV_ADDMULTI);
+    DBIS->neatsvpvlen = get_sv("DBI::neat_maxlen", GV_ADDMULTI);
 #ifdef DBI_USE_THREADS
-    DBIS->thr_owner   = PERL_GET_THX;
+    DBIS->thr_owner   = aTHX;
 #endif
 
     /* store some function pointers so DBD's can call our functions     */
@@ -541,8 +640,12 @@ dbi_bootinit(dbistate_t * parent_dbis)
     /* we only need to check the env var on the initial boot
      * which is handy because it can core dump during CLONE on windows
      */
-    if (!parent_dbis && getenv("PERL_DBI_XSBYPASS"))
-        use_xsbypass = atoi(getenv("PERL_DBI_XSBYPASS"));
+    if (!parent_dbis) {
+        MY_CXT.use_xsbypass = 1;
+        if (getenv("PERL_DBI_XSBYPASS"))
+            MY_CXT.use_xsbypass = atoi(getenv("PERL_DBI_XSBYPASS"));
+        MY_CXT.force_scalar = dbi_arch_force_scalar_env();
+    }
 }
 
 
@@ -671,11 +774,15 @@ neatsvpv(SV *sv, STRLEN maxlen) /* return a tidy ascii value, for debugging only
     if (infosv)
         sv_catsv(nsv, infosv);
     v = SvPV(nsv, len);
-    if (!SvUTF8(sv)) {
-        while(len-- > 0) { /* cleanup string (map control chars to ascii etc) */
-            const char c = v[len] & 0x7F;       /* ignore top bit for multinational chars */
+    if (!SvUTF8(sv) && len > 0) {
+        STRLEN start = (!infosv && len >= 2 && v[0] == '\'' && v[len - 1] == '\'') ? 1 : 0;
+        STRLEN end   = (!infosv && len >= 2 && v[0] == '\'' && v[len - 1] == '\'') ? len - 1 : len;
+        STRLEN off   = start + dbi_scan_nonprint_or_quote(v + start, end - start, MY_CXT.force_scalar);
+        while (off < end) { /* cleanup string (map control chars to ascii etc) */
+            const char c = v[off] & 0x7F;       /* ignore top bit for multinational chars */
             if (!isPRINT(c) && !isSPACE(c))
-                v[len] = '.';
+                v[off] = '.';
+            off++;
         }
     }
     return v;
@@ -1281,7 +1388,13 @@ dbih_make_com(SV *p_h, imp_xxh_t *p_imp_xxh, const char *imp_class, STRLEN imp_s
     if (trace_level >= 5) {
         dMY_CXT;
         PerlIO_printf(DBILOGFP,"    dbih_make_com(%s, %p, %s, %ld, %p) thr#%p\n",
-            neatsvpv(p_h,0), (void*)p_imp_xxh, imp_class, (long)imp_size, (void*)imp_templ, (void*)PERL_GET_THX);
+            neatsvpv(p_h,0), (void*)p_imp_xxh, imp_class, (long)imp_size, (void*)imp_templ,
+#ifdef MULTIPLICITY
+            (void*)aTHX
+#else
+            (void*)PERL_GET_THX
+#endif
+        );
     }
 
     if (imp_templ && SvOK(imp_templ)) {
@@ -1352,7 +1465,7 @@ dbih_make_com(SV *p_h, imp_xxh_t *p_imp_xxh, const char *imp_class, STRLEN imp_s
         ++DBIc_KIDS(p_imp_xxh);
     }
 #ifdef DBI_USE_THREADS
-    DBIc_THR_USER(imp) = PERL_GET_THX ;
+    DBIc_THR_USER(imp) = aTHX ;
 #endif
 
     if (DBIc_TYPE(imp) == DBIt_ST) {
@@ -3201,7 +3314,10 @@ XS(XS_DBI_dispatch)
 
     ima_flags  = ima->flags;
     meth_type = ima->meth_type;
-    if (trace_level >= 9) {
+    if (DBI_LIKELY(MY_CXT.ima_cache != NULL) && DBI_LIKELY(ima->ima_id < MY_CXT.ima_cache->len)) {
+        DBI_PREFETCH_READ(&MY_CXT.ima_cache->entries[ima->ima_id]);
+    }
+    if (DBI_UNLIKELY(trace_level >= 9)) {
         PerlIO *logfp = DBILOGFP;
         PerlIO_printf(logfp,"%c   >> %-11s DISPATCH (%s rc%ld/%ld @%ld g%x ima%lx pid#%ld)",
             (PL_dirty?'!':' '), meth_name, neatsvpv(h,0),
@@ -3654,28 +3770,33 @@ XS(XS_DBI_dispatch)
             }
         }
 
-        if (is_orig_method_name
-            && ima->stash == DBIc_IMP_STASH(imp_xxh)
-            && ima->generation == PL_sub_generation +
-                                        MY_cache_gen(DBIc_IMP_STASH(imp_xxh))
-        )
-            imp_msv = (SV*)ima->gv;
-        else {
-            imp_msv = (SV*)gv_fetchmethod_autoload(DBIc_IMP_STASH(imp_xxh),
-                                            meth_name, FALSE);
-            if (is_orig_method_name) {
-                /* clear stale entry, if any */
-                SvREFCNT_dec(ima->stash);
-                SvREFCNT_dec(ima->gv);
-                if (!imp_msv) {
-                    ima->stash = NULL;
-                    ima->gv    = NULL;
-                }
-                else {
-                    ima->stash = (HV*)SvREFCNT_inc(DBIc_IMP_STASH(imp_xxh));
-                    ima->gv    = (GV*)SvREFCNT_inc(imp_msv);
-                    ima->generation = PL_sub_generation +
-                                        MY_cache_gen(DBIc_IMP_STASH(imp_xxh));
+        {
+            dbi_ima_cache_entry_t *ic = DBI_LIKELY(is_orig_method_name)
+                ? dbi_ima_cache_slot(aTHX_ aMY_CXT_ ima->ima_id)
+                : NULL;
+            if (DBI_LIKELY(ic != NULL
+                && ic->stash == DBIc_IMP_STASH(imp_xxh)
+                && ic->generation == PL_sub_generation +
+                                            MY_cache_gen(DBIc_IMP_STASH(imp_xxh)))
+            )
+                imp_msv = (SV*)ic->gv;
+            else {
+                imp_msv = (SV*)gv_fetchmethod_autoload(DBIc_IMP_STASH(imp_xxh),
+                                                meth_name, FALSE);
+                if (ic) {
+                    /* clear stale entry, if any */
+                    SvREFCNT_dec(ic->stash);
+                    SvREFCNT_dec(ic->gv);
+                    if (!imp_msv) {
+                        ic->stash = NULL;
+                        ic->gv    = NULL;
+                    }
+                    else {
+                        ic->stash = (HV*)SvREFCNT_inc(DBIc_IMP_STASH(imp_xxh));
+                        ic->gv    = (GV*)SvREFCNT_inc(imp_msv);
+                        ic->generation = PL_sub_generation +
+                                            MY_cache_gen(DBIc_IMP_STASH(imp_xxh));
+                    }
                 }
             }
         }
@@ -3742,7 +3863,11 @@ XS(XS_DBI_dispatch)
          */
 
         /* SHORT-CUT ALERT! */
-        if (use_xsbypass && CvISXSUB(meth_cv) && CvXSUB(meth_cv)) {
+        if (DBI_LIKELY(MY_CXT.use_xsbypass && CvISXSUB(meth_cv) && CvXSUB(meth_cv)
+#ifdef CvMT_REMOTE
+            && !CvMT_REMOTE(meth_cv)
+#endif
+        )) {
 
             /* If we are calling an XSUB we jump directly to its C code and
              * bypass perl_call_sv(), pp_entersub() etc. This is fast.
@@ -4121,6 +4246,7 @@ SV *
 preparse(SV *dbh, const char *statement, IV ps_return, IV ps_accept, void *foo)
 {
     dTHX;
+    dMY_CXT;
     D_imp_xxh(dbh);
 /*
         The idea here is that ps_accept defines which constructs to
@@ -4189,8 +4315,24 @@ preparse(SV *dbh, const char *statement, IV ps_return, IV ps_accept, void *foo)
     src  = statement;
     dest = SvPVX(new_stmt_sv);
 
+    {
+        const char * const stmt_end = statement + sln;
+        const int force_scalar = MY_CXT.force_scalar;
+
     while( *src )
     {
+        if (DBI_LIKELY(!in_comment && !in_quote)) {
+            const char *plain_end = dbi_scan_sql_plain(src, stmt_end, force_scalar);
+            if (plain_end > src) {
+                STRLEN plain_len = (STRLEN)(plain_end - src);
+                Copy(src, dest, plain_len, char);
+                src  += plain_len;
+                dest += plain_len;
+                if (!*src)
+                    break;
+            }
+        }
+
         if (*src == '%' && PS_return(DBIpp_ph_sp))
             *dest++ = '%';
 
@@ -4426,6 +4568,7 @@ preparse(SV *dbh, const char *statement, IV ps_return, IV ps_accept, void *foo)
         }
         laststyle = style;
     }
+    }
     *dest = '\0';
 
     /* warn about probable parsing errors, but continue anyway (returning processed string) */
@@ -4467,11 +4610,13 @@ PROTOTYPES: DISABLE
 BOOT:
     {
         MY_CXT_INIT;
-        PERL_UNUSED_VAR(MY_CXT);
+        MY_CXT.ima_cache = NULL;
+        MY_CXT.use_xsbypass = 1;
+        MY_CXT.force_scalar = 0;
     }
     PERL_UNUSED_VAR(cv);
     PERL_UNUSED_VAR(items);
-    dbi_bootinit(NULL);
+    dbi_bootinit(aTHX_ NULL);
     /* make this sub into a fake XS so it can bee seen by DBD::* modules;
      * never actually call it as an XS sub, or it will crash and burn! */
     (void) newXS("DBI::_dbi_state_lval", (XSUBADDR_t)(void (*) (void))_dbi_state_lval, __FILE__);
@@ -4580,8 +4725,9 @@ _clone_dbis()
     (void)cv;
     {
         MY_CXT_CLONE;
+        MY_CXT.ima_cache = NULL;
     }
-    dbi_bootinit(parent_dbis);
+    dbi_bootinit(aTHX_ parent_dbis);
 
 
 void
@@ -4698,6 +4844,83 @@ looks_like_number(...)
             PUSHs(&PL_sv_no);
     }
 
+SV *
+mt_arch_info()
+    CODE:
+    {
+        dMY_CXT;
+        HV *hv = newHV();
+        int fs = MY_CXT.force_scalar ? 1 : 0;
+        const char *simd_name = dbi_arch_simd_name(fs);
+        (void)cv;
+        (void)hv_stores(hv, "arch",         newSVpv(DBI_ARCH_NAME, 0));
+        (void)hv_stores(hv, "simd",         newSVpv(simd_name, 0));
+        (void)hv_stores(hv, "cacheline",    newSViv((IV)DBI_CACHELINE_SIZE));
+        (void)hv_stores(hv, "force_scalar", newSViv((IV)fs));
+        (void)hv_stores(hv, "ebcdic",       newSViv((IV)DBI_ARCH_IS_EBCDIC));
+        RETVAL = newRV_noinc((SV *)hv);
+    }
+    OUTPUT:
+    RETVAL
+
+SV *
+_mt_rtrim_spaces(sv, force_scalar=-1)
+    SV *        sv
+    IV          force_scalar
+    CODE:
+    {
+        dMY_CXT;
+        STRLEN len, new_len;
+        const char *pv;
+        int fs = (force_scalar < 0) ? MY_CXT.force_scalar : (force_scalar ? 1 : 0);
+        (void)cv;
+        if (!SvOK(sv)) {
+            RETVAL = &PL_sv_undef;
+        }
+        else {
+            pv = SvPV(sv, len);
+            new_len = dbi_rtrim_spaces_len(pv, len, fs);
+            RETVAL = newSVpvn(pv, new_len);
+            if (SvUTF8(sv))
+                SvUTF8_on(RETVAL);
+        }
+    }
+    OUTPUT:
+    RETVAL
+
+UV
+_mt_scan_sql_plain(sv, force_scalar=-1)
+    SV *        sv
+    IV          force_scalar
+    CODE:
+    {
+        dMY_CXT;
+        STRLEN len;
+        const char *pv = SvPV(sv, len);
+        int fs = (force_scalar < 0) ? MY_CXT.force_scalar : (force_scalar ? 1 : 0);
+        const char *p = dbi_scan_sql_plain(pv, pv + len, fs);
+        (void)cv;
+        RETVAL = (UV)(p - pv);
+    }
+    OUTPUT:
+    RETVAL
+
+UV
+_mt_scan_nonprint_or_quote(sv, force_scalar=-1)
+    SV *        sv
+    IV          force_scalar
+    CODE:
+    {
+        dMY_CXT;
+        STRLEN len;
+        const char *pv = SvPV(sv, len);
+        int fs = (force_scalar < 0) ? MY_CXT.force_scalar : (force_scalar ? 1 : 0);
+        (void)cv;
+        RETVAL = (UV)dbi_scan_nonprint_or_quote(pv, len, fs);
+    }
+    OUTPUT:
+    RETVAL
+
 
 void
 _install_method(dbi_class, meth_name, file, attribs=Nullsv)
@@ -4723,6 +4946,7 @@ _install_method(dbi_class, meth_name, file, attribs=Nullsv)
         sv_catpvf(trace_msg, "install_method %-21s", meth_name);
 
     Newxz(ima, 1, dbi_ima_t);
+    ima->ima_id = dbi_ima_alloc_id();
 
     if (attribs && SvOK(attribs)) {
         /* convert and store method attributes in a fast access form    */
@@ -4754,6 +4978,9 @@ _install_method(dbi_class, meth_name, file, attribs=Nullsv)
         PerlIO_printf(DBILOGFP,"%s\n", SvPV_nolen(trace_msg));
     file = savepv(file);
     cv = newXS(meth_name, XS_DBI_dispatch, file);
+#ifdef CvMT_THREADSAFE_on
+    CvMT_THREADSAFE_on(cv);
+#endif
     SvPVX((SV *)cv) = file;
     SvLEN((SV *)cv) = 1;
     CvXSUBANY(cv).any_ptr = ima;
@@ -5191,12 +5418,15 @@ _set_fbav(sth, src_rv)
     SV *        sth
     SV *        src_rv
     CODE:
+    dMY_CXT;
     D_imp_sth(sth);
     int i;
     AV *src_av;
     AV *dst_av = dbih_get_fbav(imp_sth);
     int dst_fields = AvFILL(dst_av)+1;
     int src_fields;
+    const int chop_blanks = DBIc_is(imp_sth, DBIcf_ChopBlanks) ? 1 : 0;
+    const int force_scalar = MY_CXT.force_scalar;
     (void)cv;
 
     if (!SvROK(src_rv) || SvTYPE(SvRV(src_rv)) != SVt_PVAV)
@@ -5225,10 +5455,20 @@ _set_fbav(sth, src_rv)
         SvREADONLY_on(dst_av);
     }
     for(i=0; i < dst_fields; ++i) {     /* copy over the row    */
+        SV *dst_sv = AvARRAY(dst_av)[i];
         /* If we're given the values, then taint them if required */
         if (DBIc_is(imp_sth, DBIcf_TaintOut))
             SvTAINT(AvARRAY(src_av)[i]);
-        sv_setsv(AvARRAY(dst_av)[i], AvARRAY(src_av)[i]);
+        sv_setsv(dst_sv, AvARRAY(src_av)[i]);
+        if (DBI_UNLIKELY(chop_blanks) && SvPOK(dst_sv) && !SvROK(dst_sv)) {
+            STRLEN cur_len;
+            char *pv = SvPV_force(dst_sv, cur_len);
+            STRLEN new_len = dbi_rtrim_spaces_len(pv, cur_len, force_scalar);
+            if (new_len < cur_len) {
+                pv[new_len] = '\0';
+                SvCUR_set(dst_sv, new_len);
+            }
+        }
     }
     ST(0) = sv_2mortal(newRV_inc((SV*)dst_av));
 

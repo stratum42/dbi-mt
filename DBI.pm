@@ -546,7 +546,7 @@ END {
 sub CLONE {
     _clone_dbis() unless $DBI::PurePerl; # clone the DBIS structure
     DBI->trace_msg("CLONE DBI for new thread\n");
-    while ( my ($driver, $drh) = each %DBI::installed_drh) {
+    for my $driver (keys %DBI::installed_drh) {
 	no strict 'refs';
 	next if defined &{"DBD::${driver}::CLONE"};
 	warn("$driver has no driver CLONE() function so is unsafe threaded\n");
@@ -1310,7 +1310,7 @@ sub _new_sth {	# called by DBD::<drivername>::db::prepare)
 
     $DBD::Switch::dr::imp_data_size = 0;
     $DBD::Switch::dr::imp_data_size = 0;	# avoid typo warning
-    my $drh;
+    our $drh;
 
     sub driver {
 	return $drh if $drh;	# a package global

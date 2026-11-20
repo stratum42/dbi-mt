@@ -17,7 +17,7 @@ use warnings;
 #   License or the Artistic License, as specified in the Perl README file.
 
     our $drh = undef;	# holds driver handle once initialised
-    my $methods_already_installed;
+    our $methods_already_installed;
 
     sub driver{
 	return $drh if $drh;

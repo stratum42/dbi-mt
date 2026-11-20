@@ -4,6 +4,7 @@ cpanfile
 dbd_xsh.h			Prototypes for standard Driver.xst interface
 DBI.pm				The Database Interface Module Perl code
 DBI.xs				The Database Interface Module XS code
+dbi_arch.h			Architecture detection, portable atomics, and dual-gated SIMD kernels
 dbi_sql.h			Definitions based on SQL CLI / ODBC (#inc'd by DBIXS.h)
 dbilogstrip.PL			Utility to normalise DBI logs so they can be compared with diff
 dbipport.h			Perl portability macros (from Devel::PPort)
@@ -60,6 +61,7 @@ lib/DBI/Gofer/Serializer/Storable.pm
 lib/DBI/Gofer/Transport/Base.pm	Base class for DBD::Gofer server transport classes
 lib/DBI/Gofer/Transport/pipeone.pm	DBD::Gofer transport for single requests
 lib/DBI/Gofer/Transport/stream.pm	DBI::Gofer transport for ssh etc
+lib/DBI/MT/Pool.pm		Per-worker fiber-aware connection pool for perl5-mt
 lib/DBI/Profile.pm		Manage DBI usage profile data
 lib/DBI/ProfileData.pm
 lib/DBI/ProfileDumper.pm
@@ -75,6 +77,7 @@ lib/Win32/DBIODBC.pm		An experimental Win32::ODBC emulation layer for DBI
 LICENSE
 Makefile.PL			The Makefile generator
 MANIFEST
+MT_README.md			perl5-mt Tier 1 support notes and caveats
 Perl.xs				Test harness (currently) for Driver.xst
 README.md
 SECURITY.md
@@ -126,4 +129,10 @@ t/87gofer_cache.t
 t/90sql_type_cast.t
 t/91_store_warning.t
 t/lib.pl			Utility functions for test scripts
+t/mt_01_tier1.t			perl5-mt Tier 1 XSUB and freeze verification
+t/mt_02_workers.t		perl5-mt concurrent worker tests across pure-Perl DBDs
+t/mt_03_pool_fibers.t		perl5-mt DBI::MT::Pool and MT::Fiber contention tests
+t/mt_04_sqlite.t		perl5-mt Tier 1 DBD::SQLite integration tests
+t/mt_05_odbc.t			perl5-mt Tier 1 DBD::ODBC integration tests
+t/mt_06_arch_simd.t		perl5-mt dual-gated arch/SIMD parity & micro-benchmark tests
 typemap

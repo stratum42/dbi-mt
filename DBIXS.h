@@ -22,6 +22,10 @@
 /* Here for backwards compat. PERL_POLLUTE was removed in perl 5.13.3 */
 #define PERL_POLLUTE
 
+#if defined(PERL_XS_THREADSAFE) && !defined(PERL_NO_GET_CONTEXT)
+#define PERL_NO_GET_CONTEXT
+#endif
+
 /* first pull in the standard Perl header files for extensions  */
 #include <EXTERN.h>
 #include <perl.h>
@@ -42,6 +46,9 @@
 
 /* DBI SQL_* type definitions */
 #include "dbi_sql.h"
+
+/* Architecture detection, cache-line sizing, portable atomics & dual-gated SIMD */
+#include "dbi_arch.h"
 
 #ifdef NEED_DBIXS_VERSION
 #if NEED_DBIXS_VERSION > DBIXS_VERSION
@@ -488,16 +495,21 @@ struct dbistate_st {
 
 typedef dbistate_t** (*_dbi_state_lval_t)(pTHX);
 
+#define _DBI_ATOMIC_LOAD_PTR(var)       dbi_atomic_load_acquire_ptr(var)
+#define _DBI_ATOMIC_STORE_PTR(var, val) dbi_atomic_store_release_ptr(var, val)
+
 # define _DBISTATE_DECLARE_COMMON \
     static _dbi_state_lval_t dbi_state_lval_p = 0;                          \
     static dbistate_t** dbi_get_state(pTHX) {                               \
-        if (!dbi_state_lval_p) {                                            \
+        _dbi_state_lval_t fn = (_dbi_state_lval_t)_DBI_ATOMIC_LOAD_PTR(dbi_state_lval_p); \
+        if (DBI_UNLIKELY(!fn)) {                                            \
             CV *cv = get_cv("DBI::_dbi_state_lval", 0);                     \
             if (!cv)                                                        \
                 croak("Unable to get DBI state function. DBI not loaded."); \
-            dbi_state_lval_p = (_dbi_state_lval_t)(void *)CvXSUB(cv);       \
+            fn = (_dbi_state_lval_t)(void *)CvXSUB(cv);                     \
+            _DBI_ATOMIC_STORE_PTR(dbi_state_lval_p, fn);                    \
         }                                                                   \
-        return dbi_state_lval_p(aTHX);                                      \
+        return fn(aTHX);                                                    \
     }                                                                       \
     typedef int dummy_dbistate /* keep semicolon from feeling lonely */
 

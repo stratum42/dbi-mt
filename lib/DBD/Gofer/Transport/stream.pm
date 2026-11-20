@@ -21,7 +21,11 @@ __PACKAGE__->mk_accessors(qw(
 ));
 
 my $persist_all = 5;
-my %persist;
+our %persist;
+
+sub CLONE {
+    %persist = ();
+}
 
 
 sub _connection_key {

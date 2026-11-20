@@ -197,7 +197,7 @@ sub valid_attribute {
     return 0
 }
 
-my $initial_setup;
+our $initial_setup;
 sub initial_setup {
     $initial_setup = 1;
     print $DBI::tfh  __FILE__ . " version " . $DBI::PurePerl::VERSION . "\n"
@@ -409,6 +409,7 @@ sub  _install_method {
     my $method_code = q[
       sub {
         my $h = shift;
+	my $method_name = $orig_method_name;
 	my $h_inner = tied(%$h);
 	$h = $h_inner if $h_inner;
 
@@ -434,7 +435,7 @@ sub  _install_method {
 
 	my @ret;
         my $sub = $imp->can($method_name);
-        if (!$sub and IMA_FUNC_REDIRECT & $bitmask and $sub = $imp->can('func')) {
+        if (!$sub and ] . ((IMA_FUNC_REDIRECT & $bitmask) ? 1 : 0) . q[ and $sub = $imp->can('func')) {
             push @_, $method_name;
         }
 	if ($sub) {
@@ -454,9 +455,10 @@ sub  _install_method {
       }
     ];
     no strict qw(refs);
-    my $code_ref = eval qq{#line 1 "DBI::PurePerl $method"\n$method_code};
+    my $factory = eval qq{#line 1 "DBI::PurePerl $method"\nsub { my (\$orig_method_name, \$bitmask) = \@_; return $method_code; }};
     warn "$@\n$method_code\n" if $@;
     die "$@\n$method_code\n" if $@;
+    my $code_ref = $factory->($method_name, $bitmask);
     *$method = $code_ref;
     if (0 && $method =~ /\b(connect|FETCH)\b/) { # debuging tool
 	my $l=0; # show line-numbered code for method

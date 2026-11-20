@@ -21,7 +21,11 @@ __PACKAGE__->mk_accessors(qw(
     transmit_count
 ));
 
-my $executor = DBI::Gofer::Execute->new();
+our $executor;
+
+sub CLONE {
+    undef $executor;
+}
 
 
 sub transmit_request_by_transport {
@@ -34,6 +38,7 @@ sub transmit_request_by_transport {
     # the request is magically transported over to ... ourselves
     # ...
 
+    $executor ||= DBI::Gofer::Execute->new();
     my $response = $executor->execute_request( $self->thaw_request($frozen_request, undef, 1) );
 
     # put response 'on the shelf' ready for receive_response()
